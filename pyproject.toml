@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3-fused-cce"
+version = "0.1.0"
+description = "Fused Cut Cross-Entropy kernel for Qwen3.5"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "transformers",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[tool.setuptools.packages.find]
+include = ["qwen3_cce*"]

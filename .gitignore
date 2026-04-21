@@ -1,0 +1,9 @@
+.venv/
+.hf_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+bench_*_out/
+bench_*_result.json
