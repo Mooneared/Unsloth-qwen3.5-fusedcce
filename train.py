@@ -5,11 +5,17 @@ Usage:
   # Single GPU
   python train.py
 
-  # Multi-GPU (DDP)
-  torchrun --nproc_per_node=8 train.py
+  # Multi-GPU DDP (recommended for LoRA — base model fits on each GPU)
+  torchrun --nproc_per_node=2 train.py    # 2× RTX PRO 6000
+  torchrun --nproc_per_node=4 train.py    # 4× RTX PRO 6000
+  torchrun --nproc_per_node=8 train.py    # 8× H100/B200
 
-  # Multi-GPU (accelerate)
-  accelerate launch --num_processes=8 train.py
+DDP vs FSDP for LoRA:
+  - DDP: each GPU has full base model. Only LoRA grads (~170 MB) sync per step.
+    Near-linear scaling. Use this whenever base model fits on one GPU.
+  - FSDP: shards base weights across GPUs. Adds all-gather comm per layer,
+    which is *slower* on PCIe (no NVLink on RTX PRO 6000). Only worth it if
+    the base model doesn't fit on one GPU (e.g., 27B on 24-48 GB GPUs).
 """
 
 import os, json
@@ -25,13 +31,13 @@ from datasets import load_from_disk
 
 # ── Config ────────────────────────────────────────────────────────────────
 # Model
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-MAX_SEQ_LEN = 65536              # set to longest seq in dataset; shorter seqs get packed
+MODEL_NAME = "Qwen/Qwen3.5-9B"
+MAX_SEQ_LEN = 77695              # max(tokens) + 1 from prepare_data.py
 LOAD_IN_4BIT = False            # True for QLoRA (halves weight VRAM)
 
 # LoRA
-LORA_R = 16                     # 64 for 9B/27B
-LORA_ALPHA = 16                 # typically = LORA_R
+LORA_R = 64                     # 64 for 9B/27B, 16 for 0.8B/4B
+LORA_ALPHA = 64                 # typically = LORA_R
 LORA_TARGETS = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
@@ -47,9 +53,10 @@ GRAD_CKPT = True
 DATA_DIR = "./data_prepared"        # output of prepare_data.py (has "text" column)
 BATCH_SIZE = 1
 GRAD_ACCUM = 4                  # effective batch = BATCH_SIZE * GRAD_ACCUM * num_gpus
-NUM_EPOCHS = 2
-LR = 2e-4                       # 2e-4 for 0.8B, 2e-5 for 9B, 1e-5 for 27B
-WARMUP_RATIO = 0.05
+                                # 2 GPUs DDP × bs=1 × accum=4 = effective 8
+NUM_EPOCHS = 3                  # small datasets (≤500 traces) benefit from 3 epochs
+LR = 2e-5                       # 2e-4 for 0.8B, 2e-5 for 9B, 1e-5 for 27B
+WARMUP_RATIO = 0.1              # 10% for small datasets, 5% for larger
 OUTPUT_DIR = "./output"
 
 # ── Load model ────────────────────────────────────────────────────────────
