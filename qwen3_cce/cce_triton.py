@@ -343,30 +343,38 @@ def _ce_backward_grad_hidden_only(
     N, H = hidden_states.shape
     V = weight.shape[0]
     device = hidden_states.device
+    w_dtype = weight.dtype
 
     mask = labels != ignore_index
     n_valid = mask.sum().clamp(min=1).float()
-    scale = (grad_output / n_valid)
+    scale = float((grad_output / n_valid).item())  # scalar
+    mask_col = mask.unsqueeze(1)              # [N, 1] bool — hoisted
 
-    # Use chunks of ~8K vocab → ~8K * H * 4 bytes = ~80 MB per chunk for H=2560
+    # Chunks of 8K vocab → BF16 matmul, FP32 accumulate. Tensor cores active.
     CHUNK = 8192
     grad_hidden = torch.zeros_like(hidden_states, dtype=torch.float32)
-    lse_col = lse.unsqueeze(1)  # [N, 1]
-    labels_col = labels.unsqueeze(1)  # [N, 1]
+    lse_col = lse.unsqueeze(1)                # [N, 1]
 
     for v0 in range(0, V, CHUNK):
         v1 = min(v0 + CHUNK, V)
-        w_chunk = weight[v0:v1]  # [chunk, H]
-        # logits: [N, chunk]
-        logits = (hidden_states.float() @ w_chunk.float().T)
-        probs = torch.exp(logits - lse_col)
-        # subtract 1 for the target token column if it lies in this chunk
-        v_idx = torch.arange(v0, v1, device=device).unsqueeze(0)  # [1, chunk]
-        is_target = (labels_col == v_idx) & mask.unsqueeze(1)
-        probs = probs - is_target.float()
-        # zero out ignored rows
-        probs = probs * mask.unsqueeze(1).float()
-        # accumulate grad_hidden += probs @ w_chunk
-        grad_hidden += (probs @ w_chunk.float()) * scale
+        w_chunk = weight[v0:v1]               # [chunk, H] in BF16
+
+        # BF16 matmul, FP32 accumulate via cuBLAS — much faster than FP32 GEMM
+        logits = hidden_states @ w_chunk.T    # [N, chunk] BF16
+        probs = torch.exp(logits.float() - lse_col)  # FP32 for stability
+
+        # Subtract 1 at target column for tokens whose label lies in this chunk.
+        # Avoid materializing [N, chunk] bool — scatter only the relevant rows.
+        in_chunk = mask & (labels >= v0) & (labels < v1)
+        if in_chunk.any():
+            rows = in_chunk.nonzero(as_tuple=True)[0]
+            probs[rows, labels[rows] - v0] -= 1.0
+
+        # Zero out grad rows for ignored tokens
+        probs.mul_(mask_col)
+
+        # grad_hidden += (probs @ w_chunk) * scale
+        # Cast probs back to BF16 for the matmul, FP32 accum
+        grad_hidden.addmm_(probs.to(w_dtype), w_chunk, alpha=scale)
 
     return grad_hidden.to(hidden_states.dtype)
