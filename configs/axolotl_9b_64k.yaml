@@ -1,0 +1,72 @@
+# Axolotl config: Qwen3.5-9B LoRA SFT, 64K seqlen, 8×H100
+# SP=4 (sequence parallel), DP=2 (data parallel)
+#
+# Launch: accelerate launch -m axolotl.cli.train configs/axolotl_9b_64k.yaml
+
+base_model: Qwen/Qwen3.5-9B
+model_type: AutoModelForCausalLM
+trust_remote_code: true
+
+# ── LoRA ───────────────────────────────────────────────────────────────────
+adapter: lora
+lora_r: 64
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+lora_target_linear: false
+
+# ── Dataset ────────────────────────────────────────────────────────────────
+# Adjust path to your data. Expects JSONL with "text" field or
+# conversation format with "conversations" field.
+datasets:
+  - path: /path/to/your/traces.jsonl
+    type: completion
+    field_messages: text
+
+# ── Sequence length ────────────────────────────────────────────────────────
+sequence_len: 65536
+sample_packing: true       # pack shorter samples together
+pad_to_sequence_len: false
+
+# ── Training ───────────────────────────────────────────────────────────────
+num_epochs: 2
+micro_batch_size: 1        # per GPU, per SP group
+gradient_accumulation_steps: 4  # effective batch = 1 * 2 (DP) * 4 (accum) = 8 samples
+learning_rate: 2e-5
+lr_scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+optimizer: adamw_torch
+bf16: true
+tf32: true
+
+# ── Gradient checkpointing ────────────────────────────────────────────────
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+# ── Sequence parallelism (Ring Attention) ─────────────────────────────────
+# SP=4 means 4 GPUs share one sequence, DP=2 means 2 independent replicas
+# Total: 4 × 2 = 8 GPUs
+ring_attention: true
+# Axolotl determines sp_size from process groups; set via accelerate config
+# or NCCL env. With 8 GPUs and this config, use:
+#   accelerate launch --num_processes 8
+
+# ── Logging / saving ──────────────────────────────────────────────────────
+output_dir: ./outputs/qwen3.5-9b-64k-lora
+logging_steps: 1
+save_strategy: steps
+save_steps: 50
+eval_strategy: "no"
+
+# ── Performance ────────────────────────────────────────────────────────────
+flash_attention: true
+torch_compile: false       # can enable for ~10% speedup after warmup

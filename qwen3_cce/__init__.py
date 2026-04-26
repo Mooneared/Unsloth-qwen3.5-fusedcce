@@ -27,9 +27,13 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 from .loss import FusedLinearCrossEntropyLoss
+from .fused_swiglu import fused_swiglu_mlp, FusedSwiGLUFunction, fused_swiglu_activation
 
 __all__ = [
     "FusedLinearCrossEntropyLoss",
     "FusedCrossEntropyLossTorch",
+    "fused_swiglu_mlp",
+    "fused_swiglu_activation",
+    "FusedSwiGLUFunction",
     "TRITON_AVAILABLE",
 ]

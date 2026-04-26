@@ -7,3 +7,15 @@ dist/
 build/
 bench_*_out/
 bench_*_result.json
+
+# data + training outputs
+data_prepared/
+data_tokenized/
+looped_model_out/
+output/
+neko-data.jsonl
+
+# local clones / archives
+unsloth/
+unsloth-zoo/
+*.zip

@@ -1,7 +1,8 @@
 """
 bench_default.py — Baseline: Unsloth SFT with default loss on Qwen3.5-0.8B.
 
-Run on Colab with a T4/A100 GPU. Measures training throughput and peak VRAM.
+Run on Colab with a T4/L4/A100 GPU. Measures training throughput and peak VRAM.
+Uses realistic SFT sequence lengths.
 """
 
 import os, time, json
@@ -16,10 +17,10 @@ from datasets import Dataset
 
 # ── Config ─────────────────────────────────────────────────────────────────
 MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-MAX_SEQ_LEN = 1024
+MAX_SEQ_LEN = 8192
 NUM_STEPS = 20
 BATCH_SIZE = 2
-GRAD_ACCUM = 4
+GRAD_ACCUM = 1
 
 # ── Load model ─────────────────────────────────────────────────────────────
 model, tokenizer = FastModel.from_pretrained(
@@ -44,8 +45,8 @@ model = FastModel.get_peft_model(
 
 # ── Synthetic dataset ──────────────────────────────────────────────────────
 texts = [
-    "The quick brown fox jumps over the lazy dog. " * 40
-] * 200  # 200 samples of ~400 tokens each
+    "The quick brown fox jumps over the lazy dog. " * 800
+] * 100
 
 dataset = Dataset.from_dict({"text": texts})
 
