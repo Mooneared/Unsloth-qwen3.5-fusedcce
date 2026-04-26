@@ -300,13 +300,73 @@ class FusedCrossEntropyLossTriton(torch.autograd.Function):
         )
         ctx.save_for_backward(hidden_states, weight, labels, lse)
         ctx.ignore_index = ignore_index
+        ctx.weight_requires_grad = weight.requires_grad
         return loss
 
     @staticmethod
     def backward(ctx, grad_output):
         hidden_states, weight, labels, lse = ctx.saved_tensors
+
+        if not ctx.weight_requires_grad:
+            # Frozen lm_head (LoRA case): skip grad_weight entirely. Use
+            # PyTorch's matmul path which is well-tuned, no atomic contention.
+            grad_hidden = _ce_backward_grad_hidden_only(
+                grad_output, hidden_states, weight, labels, lse, ctx.ignore_index,
+            )
+            return grad_hidden, None, None, None
+
         grad_hidden, grad_weight, _ = fused_cross_entropy_backward_triton(
             grad_output, hidden_states, weight, labels, lse,
             ignore_index=ctx.ignore_index,
         )
         return grad_hidden, grad_weight, None, None
+
+
+def _ce_backward_grad_hidden_only(
+    grad_output: Tensor,
+    hidden_states: Tensor,    # [N, H]
+    weight: Tensor,           # [V, H]
+    labels: Tensor,           # [N]
+    lse: Tensor,              # [N]
+    ignore_index: int,
+) -> Tensor:
+    """
+    Compute only grad_hidden when lm_head is frozen.
+
+    Tiles over V in chunks of CHUNK rows. For each chunk:
+        chunk_logits = hidden @ weight[v0:v1].T      # [N, CHUNK]
+        chunk_probs  = exp(chunk_logits - lse[:, None])
+        # subtract 1 for the target column if it falls in this chunk
+        grad_hidden += chunk_probs @ weight[v0:v1] * scale
+    Uses dense matmul (well-tuned, FP8/BF16 cuBLAS) instead of Triton atomics.
+    """
+    N, H = hidden_states.shape
+    V = weight.shape[0]
+    device = hidden_states.device
+
+    mask = labels != ignore_index
+    n_valid = mask.sum().clamp(min=1).float()
+    scale = (grad_output / n_valid)
+
+    # Use chunks of ~8K vocab → ~8K * H * 4 bytes = ~80 MB per chunk for H=2560
+    CHUNK = 8192
+    grad_hidden = torch.zeros_like(hidden_states, dtype=torch.float32)
+    lse_col = lse.unsqueeze(1)  # [N, 1]
+    labels_col = labels.unsqueeze(1)  # [N, 1]
+
+    for v0 in range(0, V, CHUNK):
+        v1 = min(v0 + CHUNK, V)
+        w_chunk = weight[v0:v1]  # [chunk, H]
+        # logits: [N, chunk]
+        logits = (hidden_states.float() @ w_chunk.float().T)
+        probs = torch.exp(logits - lse_col)
+        # subtract 1 for the target token column if it lies in this chunk
+        v_idx = torch.arange(v0, v1, device=device).unsqueeze(0)  # [1, chunk]
+        is_target = (labels_col == v_idx) & mask.unsqueeze(1)
+        probs = probs - is_target.float()
+        # zero out ignored rows
+        probs = probs * mask.unsqueeze(1).float()
+        # accumulate grad_hidden += probs @ w_chunk
+        grad_hidden += (probs @ w_chunk.float()) * scale
+
+    return grad_hidden.to(hidden_states.dtype)

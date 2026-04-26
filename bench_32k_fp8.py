@@ -98,6 +98,24 @@ unsloth_zoo.fused_losses.cross_entropy_loss.unsloth_fused_ce_loss = patched_unsl
 unsloth_zoo.compiler.unsloth_fused_ce_loss = patched_unsloth_fused_ce_loss
 print("[cce] Patched unsloth's fused_linear_cross_entropy + unsloth_fused_ce_loss")
 
+def sweep_patch_ce_refs():
+    """Replace CE references in every loaded module (handles compiled cache modules)."""
+    import sys
+    swept = 0
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is None:
+            continue
+        if getattr(mod, "unsloth_fused_ce_loss", None) is not None and \
+           mod.unsloth_fused_ce_loss is not patched_unsloth_fused_ce_loss:
+            mod.unsloth_fused_ce_loss = patched_unsloth_fused_ce_loss
+            swept += 1
+        if getattr(mod, "fused_linear_cross_entropy", None) is not None and \
+           mod.fused_linear_cross_entropy is not patched_fused_linear_cross_entropy:
+            mod.fused_linear_cross_entropy = patched_fused_linear_cross_entropy
+            swept += 1
+    print(f"[cce] Swept {swept} module-level CE references")
+    return swept
+
 # ── Config ────────────────────────────────────────────────────────────────
 MODEL_NAME = "Qwen/Qwen3.5-4B"
 DATA_DIR = "./data_prepared"
@@ -125,6 +143,10 @@ model = FastModel.get_peft_model(
     lora_dropout=0,
     use_gradient_checkpointing=False,
 )
+
+# Sweep CE refs again — unsloth's compiled cache module imported the original
+# unsloth_fused_ce_loss at codegen time, binding a local reference we missed.
+sweep_patch_ce_refs()
 
 # ── Import TE AFTER model load (it patches transformers on import) ──────
 import transformer_engine.pytorch as te
@@ -231,6 +253,7 @@ training_args = SFTConfig(
     packing=True,
     seed=42,
     report_to="none",
+    gradient_checkpointing=False,
 )
 
 trainer = SFTTrainer(
