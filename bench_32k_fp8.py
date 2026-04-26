@@ -18,6 +18,12 @@ os.environ["HF_HOME"] = CACHE_DIR
 import torch
 import torch.nn as nn
 
+# ── Import unsloth first (sets UNSLOTH_IS_PRESENT for unsloth_zoo) ───────
+from unsloth import FastModel
+from unsloth.chat_templates import train_on_responses_only
+from trl import SFTTrainer, SFTConfig
+from datasets import load_from_disk
+
 # ── Patch unsloth's CE with our streaming CCE BEFORE model load ──────────
 # Must run before FastModel.from_pretrained so unsloth's compiled cache
 # picks up the patched callable.
@@ -91,12 +97,6 @@ unsloth_zoo.compiler.fused_linear_cross_entropy = patched_fused_linear_cross_ent
 unsloth_zoo.fused_losses.cross_entropy_loss.unsloth_fused_ce_loss = patched_unsloth_fused_ce_loss
 unsloth_zoo.compiler.unsloth_fused_ce_loss = patched_unsloth_fused_ce_loss
 print("[cce] Patched unsloth's fused_linear_cross_entropy + unsloth_fused_ce_loss")
-
-# ── Now safe to import unsloth ────────────────────────────────────────────
-from unsloth import FastModel
-from unsloth.chat_templates import train_on_responses_only
-from trl import SFTTrainer, SFTConfig
-from datasets import load_from_disk
 
 # ── Config ────────────────────────────────────────────────────────────────
 MODEL_NAME = "Qwen/Qwen3.5-4B"
