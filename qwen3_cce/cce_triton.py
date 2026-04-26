@@ -347,34 +347,41 @@ def _ce_backward_grad_hidden_only(
 
     mask = labels != ignore_index
     n_valid = mask.sum().clamp(min=1).float()
-    scale = float((grad_output / n_valid).item())  # scalar
-    mask_col = mask.unsqueeze(1)              # [N, 1] bool — hoisted
+    scale = float((grad_output / n_valid).item())  # 1 sync, once
 
-    # Chunks of 8K vocab → BF16 matmul, FP32 accumulate. Tensor cores active.
-    CHUNK = 8192
+    # Larger chunks → fewer kernel launches, fewer Python iterations.
+    # 32K * N * 4 bytes = 32K * 77K * 4 ≈ 10 GB FP32 — fine on 96 GB.
+    CHUNK = 32768
     grad_hidden = torch.zeros_like(hidden_states, dtype=torch.float32)
     lse_col = lse.unsqueeze(1)                # [N, 1]
+    mask_col = mask.unsqueeze(1).to(torch.float32)  # [N, 1] FP32 for mul_
+
+    # Pre-compute target offsets relative to vocab (per-row, used every chunk)
+    target_offsets = labels.clone()           # [N], will compare per chunk
+    valid_neg_one = -mask.to(torch.float32)   # [N] (-1 for valid, 0 for ignored)
 
     for v0 in range(0, V, CHUNK):
         v1 = min(v0 + CHUNK, V)
         w_chunk = weight[v0:v1]               # [chunk, H] in BF16
+        chunk_size = v1 - v0
 
-        # BF16 matmul, FP32 accumulate via cuBLAS — much faster than FP32 GEMM
+        # BF16 matmul, FP32 accumulate via cuBLAS — tensor cores active
         logits = hidden_states @ w_chunk.T    # [N, chunk] BF16
         probs = torch.exp(logits.float() - lse_col)  # FP32 for stability
 
-        # Subtract 1 at target column for tokens whose label lies in this chunk.
-        # Avoid materializing [N, chunk] bool — scatter only the relevant rows.
-        in_chunk = mask & (labels >= v0) & (labels < v1)
-        if in_chunk.any():
-            rows = in_chunk.nonzero(as_tuple=True)[0]
-            probs[rows, labels[rows] - v0] -= 1.0
+        # Vectorized: subtract valid_neg_one at column (label - v0) for rows
+        # whose label falls in this chunk. No CPU sync.
+        # Compute clamped target column; rows with out-of-range labels write
+        # to an arbitrary in-range column but we mask the contribution to 0.
+        in_chunk = (target_offsets >= v0) & (target_offsets < v1)  # [N] bool
+        col = (target_offsets - v0).clamp(0, chunk_size - 1)        # [N] safe
+        contrib = valid_neg_one * in_chunk.to(torch.float32)        # [N] in {-1, 0}
+        probs.scatter_add_(1, col.unsqueeze(1), contrib.unsqueeze(1))
 
         # Zero out grad rows for ignored tokens
         probs.mul_(mask_col)
 
-        # grad_hidden += (probs @ w_chunk) * scale
-        # Cast probs back to BF16 for the matmul, FP32 accum
+        # grad_hidden += (probs @ w_chunk) * scale  via fused addmm_
         grad_hidden.addmm_(probs.to(w_dtype), w_chunk, alpha=scale)
 
     return grad_hidden.to(hidden_states.dtype)
