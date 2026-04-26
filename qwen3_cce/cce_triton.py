@@ -342,46 +342,66 @@ def _ce_backward_grad_hidden_only(
     """
     N, H = hidden_states.shape
     V = weight.shape[0]
-    device = hidden_states.device
     w_dtype = weight.dtype
 
     mask = labels != ignore_index
     n_valid = mask.sum().clamp(min=1).float()
     scale = float((grad_output / n_valid).item())  # 1 sync, once
 
-    # Larger chunks → fewer kernel launches, fewer Python iterations.
-    # 32K * N * 4 bytes = 32K * 77K * 4 ≈ 10 GB FP32 — fine on 96 GB.
-    CHUNK = 32768
+    # Larger chunks → fewer launches, larger matmul. 64K chunks = 4 iters at V=248K.
+    # Per-chunk peak BF16 probs: 64K * 77K * 2 = 10 GB.
+    CHUNK = 65536
     grad_hidden = torch.zeros_like(hidden_states, dtype=torch.float32)
-    lse_col = lse.unsqueeze(1)                # [N, 1]
-    mask_col = mask.unsqueeze(1).to(torch.float32)  # [N, 1] FP32 for mul_
+    lse_col = lse.unsqueeze(1).to(w_dtype)         # BF16 for fused exp
 
-    # Pre-compute target offsets relative to vocab (per-row, used every chunk)
-    target_offsets = labels.clone()           # [N], will compare per chunk
-    valid_neg_one = -mask.to(torch.float32)   # [N] (-1 for valid, 0 for ignored)
+    # Hoist all per-row arithmetic out of the loop
+    chunk_id = (labels.clamp(min=0) // CHUNK)      # [N] which chunk owns each label
+    col_in_chunk = labels - chunk_id * CHUNK       # [N] column within owning chunk
+    valid_neg_one = -mask.to(w_dtype)              # [N] BF16, -1 valid / 0 ignored
+    mask_col = mask.unsqueeze(1).to(w_dtype)       # [N, 1] BF16
 
-    for v0 in range(0, V, CHUNK):
+    n_chunks = (V + CHUNK - 1) // CHUNK
+
+    for ci in range(n_chunks):
+        v0 = ci * CHUNK
         v1 = min(v0 + CHUNK, V)
-        w_chunk = weight[v0:v1]               # [chunk, H] in BF16
-        chunk_size = v1 - v0
+        w_chunk = weight[v0:v1]                    # [chunk, H] BF16
 
-        # BF16 matmul, FP32 accumulate via cuBLAS — tensor cores active
-        logits = hidden_states @ w_chunk.T    # [N, chunk] BF16
-        probs = torch.exp(logits.float() - lse_col)  # FP32 for stability
-
-        # Vectorized: subtract valid_neg_one at column (label - v0) for rows
-        # whose label falls in this chunk. No CPU sync.
-        # Compute clamped target column; rows with out-of-range labels write
-        # to an arbitrary in-range column but we mask the contribution to 0.
-        in_chunk = (target_offsets >= v0) & (target_offsets < v1)  # [N] bool
-        col = (target_offsets - v0).clamp(0, chunk_size - 1)        # [N] safe
-        contrib = valid_neg_one * in_chunk.to(torch.float32)        # [N] in {-1, 0}
-        probs.scatter_add_(1, col.unsqueeze(1), contrib.unsqueeze(1))
-
-        # Zero out grad rows for ignored tokens
-        probs.mul_(mask_col)
-
-        # grad_hidden += (probs @ w_chunk) * scale  via fused addmm_
-        grad_hidden.addmm_(probs.to(w_dtype), w_chunk, alpha=scale)
+        _ce_backward_chunk(
+            hidden_states, w_chunk, lse_col, chunk_id, col_in_chunk,
+            valid_neg_one, mask_col, grad_hidden, ci, scale,
+        )
 
     return grad_hidden.to(hidden_states.dtype)
+
+
+@torch.compile(mode="reduce-overhead", fullgraph=False, dynamic=False)
+def _ce_backward_chunk(
+    hidden_states: Tensor,    # [N, H] BF16
+    w_chunk: Tensor,          # [chunk, H] BF16
+    lse_col: Tensor,          # [N, 1] BF16
+    chunk_id: Tensor,         # [N] long, owning-chunk index
+    col_in_chunk: Tensor,     # [N] long, column within owning chunk
+    valid_neg_one: Tensor,    # [N] BF16 (-1 / 0)
+    mask_col: Tensor,         # [N, 1] BF16
+    grad_hidden: Tensor,      # [N, H] FP32 (accumulator)
+    ci: int,                  # this chunk index (Python int — baked at compile)
+    scale: float,
+) -> None:
+    """One CCE backward chunk: matmul → exp → scatter → matmul, all on GPU.
+
+    torch.compile fuses the elementwise epilogue (exp + scatter + mul) into a
+    single kernel and uses CUDA graphs (reduce-overhead) to eliminate Python
+    dispatch overhead between chunks.
+    """
+    # BF16 matmul, FP32 accumulate via cuBLAS
+    logits = hidden_states @ w_chunk.T              # [N, chunk] BF16
+    probs = torch.exp(logits - lse_col)             # BF16 throughout
+    # Subtract 1 at target column for rows whose label belongs to this chunk
+    this_chunk = (chunk_id == ci)                   # [N] bool, no CPU sync
+    contrib = (valid_neg_one * this_chunk.to(valid_neg_one.dtype)).unsqueeze(1)
+    probs.scatter_add_(1, col_in_chunk.unsqueeze(1), contrib)
+    # Zero out ignored rows
+    probs.mul_(mask_col)
+    # grad_hidden += probs @ w_chunk * scale
+    grad_hidden.addmm_(probs, w_chunk, alpha=scale)
